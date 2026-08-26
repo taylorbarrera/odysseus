@@ -59,6 +59,203 @@ async function _postSettings(body) {
 
 const el = byId;
 function esc(s) { return uiModule.esc(s); }
+
+/**
+ * Shared helpers for the inline "OAuth app not configured yet" block shown in
+ * the email account add/edit forms (ids prefixed `eaf-`/`uf-`) when the
+ * selected provider needs Google/Microsoft OAuth. The app's Client ID/Secret
+ * is instance-wide (one Google/Entra app registration shared by every
+ * account here), not a per-account secret, so it's configured once —
+ * contextually, right where a user first needs it — rather than in a
+ * disconnected global settings page. Saving is admin-gated server-side
+ * (see `_email_oauth_app_config_allowed` in routes/email_helpers.py); a
+ * non-admin sees an "ask your admin" message instead of input fields.
+ */
+async function _fetchEmailOauthAppStatus(provider) {
+  try {
+    const r = await fetch(`/api/email/oauth/${encodeURIComponent(provider)}/app-status`, { credentials: 'same-origin' });
+    if (!r.ok) return { configured: false, can_configure: false };
+    return await r.json();
+  } catch (e) {
+    return { configured: false, can_configure: false };
+  }
+}
+
+// Renders the app-config block for a given form (prefix "eaf" or "uf") and
+// hides/disables the "Connect with X" button until the app is configured.
+async function _renderEmailOauthAppConfig(prefix, provider, connectBtn) {
+  const wrap = el(`${prefix}-oauth-app-config`);
+  if (!wrap) return;
+  const msg = el(`${prefix}-oauth-app-msg`);
+  const fields = el(`${prefix}-oauth-app-fields`);
+  const tenantRow = el(`${prefix}-oauth-tenant-row`);
+  const editRow = el(`${prefix}-oauth-app-edit-row`);
+  const label = provider === 'microsoft' ? 'Microsoft' : 'Google';
+  const status = await _fetchEmailOauthAppStatus(provider);
+  if (status.configured) {
+    // Already set up — collapse the form behind an "Edit" link instead of
+    // showing input fields every time, but keep the details on hand so the
+    // link can pre-fill them (client_id/tenant only, never the secret,
+    // which the backend never sends back to the browser).
+    wrap.style.display = 'none';
+    if (fields) fields.style.display = 'none';
+    if (connectBtn) connectBtn.style.display = '';
+    if (editRow) {
+      editRow.style.display = status.can_configure ? '' : 'none';
+      editRow.dataset.clientId = status.client_id || '';
+      editRow.dataset.tenant = status.tenant || '';
+    }
+    return;
+  }
+  wrap.style.display = '';
+  if (connectBtn) connectBtn.style.display = 'none';
+  if (editRow) editRow.style.display = 'none';
+  if (status.can_configure) {
+    if (msg) {
+      msg.textContent = `${label} OAuth isn't set up on this Odysseus instance yet. Enter the app's Client ID/Secret below (one-time — this applies to every account, not just this one).`;
+      msg.style.color = '';
+    }
+    if (fields) fields.style.display = '';
+    if (tenantRow) tenantRow.style.display = provider === 'microsoft' ? '' : 'none';
+  } else {
+    if (msg) {
+      msg.textContent = `${label} OAuth isn't set up on this Odysseus instance yet. Ask an admin to configure it before connecting this account.`;
+      msg.style.color = '';
+    }
+    if (fields) fields.style.display = 'none';
+  }
+}
+
+// Wires the "Edit OAuth app credentials" link for a form: reveals the
+// (initially collapsed, already-configured) Client ID/Secret/Tenant fields,
+// pre-filling Client ID/Tenant from the last app-status fetch. The Client
+// Secret field is intentionally left blank — the backend never echoes the
+// stored secret back to the browser — and saving with it blank keeps the
+// existing secret unchanged, so an admin can fix just the ID/Tenant, or
+// enter a new secret to replace it, without needing to know the old one.
+function _wireEmailOauthAppEditLink(prefix, getProvider) {
+  const link = el(`${prefix}-oauth-app-edit-link`);
+  const editRow = el(`${prefix}-oauth-app-edit-row`);
+  const wrap = el(`${prefix}-oauth-app-config`);
+  const fields = el(`${prefix}-oauth-app-fields`);
+  const tenantRow = el(`${prefix}-oauth-tenant-row`);
+  const msg = el(`${prefix}-oauth-app-msg`);
+  if (!link) return;
+  link.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    const provider = getProvider() || 'google';
+    const label = provider === 'microsoft' ? 'Microsoft' : 'Google';
+    if (wrap) wrap.style.display = '';
+    if (fields) fields.style.display = '';
+    if (tenantRow) tenantRow.style.display = provider === 'microsoft' ? '' : 'none';
+    if (editRow) editRow.style.display = 'none';
+    if (msg) {
+      msg.textContent = `Update this instance's ${label} OAuth app credentials. Leave Client Secret blank to keep the current one.`;
+      msg.style.color = '';
+    }
+    const idInput = el(`${prefix}-oauth-client-id`);
+    const secretInput = el(`${prefix}-oauth-client-secret`);
+    const tenantInput = el(`${prefix}-oauth-tenant`);
+    if (idInput) idInput.value = (editRow && editRow.dataset.clientId) || '';
+    if (secretInput) { secretInput.value = ''; secretInput.placeholder = '(leave blank to keep current secret)'; }
+    if (tenantInput) tenantInput.value = (editRow && editRow.dataset.tenant) || '';
+  });
+}
+
+// Wires the "Save App Credentials" button for a form. `getProvider` returns
+// the currently-selected OAuth provider key (google/microsoft), since the
+// user can switch providers via the dropdown before saving.
+function _wireEmailOauthAppSave(prefix, getProvider, connectBtn) {
+  const btn = el(`${prefix}-oauth-app-save`);
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    const provider = getProvider();
+    if (!provider) return;
+    const msg = el(`${prefix}-oauth-app-msg`);
+    const clientId = (el(`${prefix}-oauth-client-id`)?.value || '').trim();
+    const clientSecret = (el(`${prefix}-oauth-client-secret`)?.value || '').trim();
+    const tenant = (el(`${prefix}-oauth-tenant`)?.value || '').trim();
+    // Client Secret may be left blank when editing an already-configured
+    // app (keeps the existing secret) — the backend enforces that a
+    // brand-new app still requires one, so just check Client ID here.
+    if (!clientId) {
+      if (msg) { msg.textContent = 'Client ID is required'; msg.style.color = 'var(--red)'; }
+      return;
+    }
+    btn.disabled = true;
+    try {
+      const r = await fetch(`/api/email/oauth/${encodeURIComponent(provider)}/app-config`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ client_id: clientId, client_secret: clientSecret, tenant }),
+      });
+      const d = await r.json();
+      if (!r.ok || !d.ok) {
+        if (msg) { msg.textContent = d.error || d.detail || 'Failed to save'; msg.style.color = 'var(--red)'; }
+        return;
+      }
+      await _renderEmailOauthAppConfig(prefix, provider, connectBtn);
+    } catch (e) {
+      if (msg) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+// Opens a blank popup window synchronously. Must be called as the very first
+// thing inside a click handler (before any `await`), since browsers only
+// allow `window.open` to bypass popup blockers when it runs synchronously
+// within a user-gesture event — calling it after an awaited fetch would get
+// blocked in Safari and some Chrome configurations. Returns null if blocked.
+function _openEmailOauthPopupWindow() {
+  const w = 520, h = 680;
+  const left = Math.round((window.screenX || 0) + Math.max(0, ((window.outerWidth || screen.width) - w) / 2));
+  const top = Math.round((window.screenY || 0) + Math.max(0, ((window.outerHeight || screen.height) - h) / 2));
+  try {
+    return window.open('about:blank', 'odysseus-email-oauth', `width=${w},height=${h},left=${left},top=${top}`);
+  } catch (e) {
+    return null;
+  }
+}
+
+// Navigates an already-open popup (see `_openEmailOauthPopupWindow`) to the
+// OAuth authorize URL and resolves once the popup reports a result (via
+// postMessage from `_handleOauthRedirect` below) or is closed without
+// completing. Falls back to a normal same-tab redirect if the popup is
+// missing/blocked, so the flow still works for strict popup blockers.
+function _waitForEmailOauthPopupResult(popup, authorizeUrl) {
+  return new Promise((resolve) => {
+    if (!popup || popup.closed) {
+      window.location.href = authorizeUrl;
+      return;
+    }
+    try { popup.location.href = authorizeUrl; } catch (e) { popup.location = authorizeUrl; }
+    try { popup.focus(); } catch (e) {}
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(poll);
+      window.removeEventListener('message', onMessage);
+      resolve(result || {});
+    };
+    function onMessage(ev) {
+      if (ev.origin !== window.location.origin) return;
+      if (!ev.data || ev.data.type !== 'odysseus-email-oauth-result') return;
+      finish(ev.data);
+      try { popup.close(); } catch (e) {}
+    }
+    window.addEventListener('message', onMessage);
+    // Fallback for browsers/situations where postMessage doesn't arrive
+    // (e.g. the user closes the popup manually) — treat as "no result".
+    const poll = setInterval(() => {
+      if (popup.closed) finish({});
+    }, 500);
+  });
+}
+
 function safeRasterDataUrl(raw) {
   const value = String(raw || '').trim();
   return /^data:image\/(?:png|jpe?g|gif|webp);base64,[a-z0-9+/=\s]+$/i.test(value) ? value : '';
@@ -2263,7 +2460,7 @@ async function initReminderSettings() {
   const smtpAccountReady = (account) => !!(
     account.smtp_host
     && account.smtp_user
-    && (account.has_smtp_password || account.oauth_provider === 'google')
+    && (account.has_smtp_password || account.oauth_provider)
   );
   try {
     const res = await fetch('/api/email/accounts', { credentials: 'same-origin' });
@@ -2771,11 +2968,15 @@ async function initEmailAccountsSettings() {
       google_workspace:  { label: 'Google Workspace / .edu',   imap: { host: 'imap.gmail.com',        port: 993, starttls: false }, smtp: { host: 'smtp.gmail.com',        port: 587 }, oauth: 'google' },
       migadu:            { label: 'Migadu',                     imap: { host: 'imap.migadu.com',       port: 993, starttls: false }, smtp: { host: 'smtp.migadu.com',       port: 465 } },
       icloud:            { label: 'iCloud',                     imap: { host: 'imap.mail.me.com',      port: 993, starttls: false }, smtp: { host: 'smtp.mail.me.com',      port: 587 } },
-      outlook:           { label: 'Outlook / Office 365',       imap: { host: 'outlook.office365.com', port: 993, starttls: false }, smtp: { host: 'smtp.office365.com',    port: 587 } },
+      outlook:           { label: 'Outlook / Office 365',       imap: { host: 'outlook.office365.com', port: 993, starttls: false }, smtp: { host: 'smtp.office365.com',    port: 587, security: 'starttls' }, oauth: 'microsoft' },
       fastmail:          { label: 'Fastmail',                   imap: { host: 'imap.fastmail.com',     port: 993, starttls: false }, smtp: { host: 'smtp.fastmail.com',     port: 465 } },
       yahoo:             { label: 'Yahoo',                      imap: { host: 'imap.mail.yahoo.com',   port: 993, starttls: false }, smtp: { host: 'smtp.mail.yahoo.com',   port: 465 } },
       dovecot:           { label: 'Dovecot IMAP (no SMTP)',     imap: { host: '',                      port: 31143, starttls: false }, smtp: { host: '',                     port: 465 } },
     };
+    // Human-readable provider name for OAuth button/status copy — keyed by
+    // the PROVIDERS[key].oauth value (also mirrors the account's persisted
+    // `oauth_provider` field and the /api/email/oauth/<provider>/... routes).
+    const OAUTH_LABELS = { google: 'Google', microsoft: 'Microsoft' };
     const _providerOptions = Object.entries(PROVIDERS)
       .map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`)
       .join('');
@@ -2789,9 +2990,21 @@ async function initEmailAccountsSettings() {
         <div class="settings-row"><label class="settings-label">Email${_hint('Your email address. Used as the From: header on outgoing mail and as the display label when Name is blank.')}</label><input id="eaf-from" class="settings-input" placeholder="you@example.com" value="${esc(a.from_address || '')}"></div>
         <div class="settings-row"><label class="settings-label">Display Name${_hint('Your name as it appears in the From: field of emails you send, e.g. Jane Smith. Auto-filled from Google during OAuth.')}</label><input id="eaf-display-name" class="settings-input" placeholder="Your Name" value="${esc(a.display_name || '')}"></div>
         <div id="eaf-oauth-section" style="display:none;margin:8px 0;padding:10px;border:1px solid var(--border);border-radius:6px;background:color-mix(in srgb,var(--accent,#50fa7b) 6%,transparent)">
-          <div style="font-size:11px;font-weight:600;margin-bottom:6px">Google OAuth2 — required for Workspace / .edu accounts</div>
-          <div id="eaf-oauth-status" style="font-size:11px;opacity:0.7;margin-bottom:6px">${a.oauth_provider === 'google' ? '✓ Connected via Google OAuth' : 'Not connected — click below to authorize'}</div>
-          <button type="button" id="eaf-oauth-btn" class="admin-btn-add" style="font-size:11px">${a.oauth_provider === 'google' ? 'Reconnect with Google' : 'Connect with Google'}</button>
+          <div id="eaf-oauth-title" style="font-size:11px;font-weight:600;margin-bottom:6px">OAuth2 — required for this provider</div>
+          <div id="eaf-oauth-status" style="font-size:11px;opacity:0.7;margin-bottom:6px">${a.oauth_provider ? `✓ Connected via ${esc(OAUTH_LABELS[a.oauth_provider] || a.oauth_provider)} OAuth` : 'Not connected — click below to authorize'}</div>
+          <div id="eaf-oauth-app-config" style="display:none;margin-bottom:8px;padding-top:8px;border-top:1px dashed var(--border);">
+            <div id="eaf-oauth-app-msg" style="font-size:11px;opacity:0.85;margin-bottom:6px"></div>
+            <div id="eaf-oauth-app-fields" style="display:none">
+              <div class="settings-row"><label class="settings-label">Client ID</label><input id="eaf-oauth-client-id" class="settings-input" placeholder="OAuth app Client ID"></div>
+              <div class="settings-row"><label class="settings-label">Client Secret</label><input id="eaf-oauth-client-secret" type="password" class="settings-input" placeholder="OAuth app Client Secret"></div>
+              <div class="settings-row" id="eaf-oauth-tenant-row" style="display:none"><label class="settings-label">Tenant</label><input id="eaf-oauth-tenant" class="settings-input" placeholder="common"></div>
+              <button type="button" id="eaf-oauth-app-save" class="admin-btn-add" style="font-size:11px">Save App Credentials</button>
+            </div>
+          </div>
+          <div id="eaf-oauth-app-edit-row" style="display:none;margin-bottom:6px;text-align:right">
+            <a href="#" id="eaf-oauth-app-edit-link" class="settings-text-link">Edit OAuth app credentials</a>
+          </div>
+          <button type="button" id="eaf-oauth-btn" class="admin-btn-add" style="font-size:11px">${a.oauth_provider ? `Reconnect with ${esc(OAUTH_LABELS[a.oauth_provider] || a.oauth_provider)}` : 'Connect'}</button>
         </div>
         <div style="font-size:11px;font-weight:600;opacity:0.6;margin:6px 0 2px">IMAP (Receiving)</div>
         <div class="settings-row"><label class="settings-label">Host${_hint('Your IMAP server, e.g. imap.gmail.com, imap.migadu.com, a LAN host, or a Tailscale IP for Dovecot.')}</label><input id="eaf-imap-host" class="settings-input" value="${esc(a.imap_host || '')}"></div>
@@ -2821,21 +3034,27 @@ async function initEmailAccountsSettings() {
     `;
 
     // Show/hide OAuth section and password fields based on provider selection.
+    let _eafOauthProvider = a.oauth_provider || '';
     function _syncOauthUI(providerKey) {
       const p = PROVIDERS[providerKey];
       const isOauth = !!(p && p.oauth);
+      _eafOauthProvider = isOauth ? p.oauth : (a.oauth_provider || '');
       el('eaf-oauth-section').style.display = isOauth ? '' : 'none';
+      if (isOauth) {
+        const label = OAUTH_LABELS[p.oauth] || p.oauth;
+        el('eaf-oauth-title').textContent = `${label} OAuth2 — required for this provider`;
+        el('eaf-oauth-status').textContent = _eafOauthProvider === p.oauth ? `✓ Connected via ${label} OAuth` : 'Not connected — click below to authorize';
+        el('eaf-oauth-btn').textContent = _eafOauthProvider === p.oauth ? `Reconnect with ${label}` : `Connect with ${label}`;
+        _renderEmailOauthAppConfig('eaf', p.oauth, el('eaf-oauth-btn'));
+      }
       formEl.querySelectorAll('.eaf-password-section').forEach(r => {
         r.style.display = isOauth ? 'none' : '';
       });
     }
+    _wireEmailOauthAppSave('eaf', () => _eafOauthProvider, el('eaf-oauth-btn'));
+    _wireEmailOauthAppEditLink('eaf', () => _eafOauthProvider);
 
-    const eafProviderNotes = {
-      outlook: {
-        title: 'Outlook / Office 365 needs OAuth',
-        body: 'Microsoft disables normal password login for IMAP/SMTP in most Outlook and Microsoft 365 accounts. Odysseus does not support Microsoft OAuth/Graph mail yet, so this preset is only a placeholder for future support.',
-      },
-    };
+    const eafProviderNotes = {};
     const eafNoteEl = el('eaf-provider-note');
     const _renderEafProviderNote = (key) => {
       const n = eafProviderNotes[key];
@@ -2865,10 +3084,13 @@ async function initEmailAccountsSettings() {
     });
 
     // Init OAuth UI for accounts already connected via OAuth.
-    if (a.oauth_provider === 'google') _syncOauthUI('google_workspace');
+    if (a.oauth_provider) _syncOauthUI(a.oauth_provider === 'microsoft' ? 'outlook' : 'google_workspace');
 
-    // "Connect with Google" button — save the account first, then redirect to OAuth.
+    // "Connect with <Provider>" button — save the account first, then redirect to OAuth.
     el('eaf-oauth-btn').addEventListener('click', async () => {
+      // Open the popup synchronously (before any await) so browsers still
+      // treat it as a direct result of this user gesture.
+      const popup = _openEmailOauthPopupWindow();
       // Must save the account first to get an account_id to pass to the OAuth flow.
       const body = {
         name: el('eaf-name').value.trim() || el('eaf-from').value.trim(),
@@ -2883,14 +3105,27 @@ async function initEmailAccountsSettings() {
         smtp_security: el('eaf-smtp-security').value,
         smtp_user: el('eaf-imap-user').value.trim(),
       };
-      if (!body.name) { el('eaf-msg').textContent = 'Enter a Name or Email first'; el('eaf-msg').style.color = 'var(--red)'; return; }
+      if (!body.name) { el('eaf-msg').textContent = 'Enter a Name or Email first'; el('eaf-msg').style.color = 'var(--red)'; try { popup && popup.close(); } catch (e) {} return; }
       const url = isEdit ? `/api/email/accounts/${a.id}` : '/api/email/accounts';
       const method = isEdit ? 'PUT' : 'POST';
       const r = await fetch(url, { method, credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const d = await r.json();
-      if (!d.ok) { el('eaf-msg').textContent = d.error || 'Save failed'; el('eaf-msg').style.color = 'var(--red)'; return; }
+      if (!d.ok) { el('eaf-msg').textContent = d.error || 'Save failed'; el('eaf-msg').style.color = 'var(--red)'; try { popup && popup.close(); } catch (e) {} return; }
       const accId = isEdit ? a.id : d.id;
-      window.location.href = `/api/email/oauth/google/authorize?account_id=${encodeURIComponent(accId)}`;
+      const provider = _eafOauthProvider || 'google';
+      const authUrl = `/api/email/oauth/${encodeURIComponent(provider)}/authorize?account_id=${encodeURIComponent(accId)}`;
+      const result = await _waitForEmailOauthPopupResult(popup, authUrl);
+      if (result.success) {
+        a.id = accId;
+        a.oauth_provider = provider;
+        _eafOauthProvider = provider;
+        el('eaf-oauth-status').textContent = `✓ Connected via ${esc(OAUTH_LABELS[provider] || provider)} OAuth`;
+        el('eaf-oauth-btn').textContent = `Reconnect with ${OAUTH_LABELS[provider] || provider}`;
+        el('eaf-msg').textContent = 'Connected'; el('eaf-msg').style.color = '';
+      } else if (result.error) {
+        el('eaf-msg').textContent = `OAuth failed: ${String(result.error).replace(/_/g, ' ')}`;
+        el('eaf-msg').style.color = 'var(--red)';
+      }
     });
     el('eaf-smtp-security').value = _smtpSecurity(a);
 
@@ -4251,11 +4486,12 @@ async function initUnifiedIntegrations() {
       google_workspace: { label: 'Google Workspace / .edu', emailEx: 'you@yourschool.edu', imap: { host: 'imap.gmail.com', port: 993, starttls: false }, smtp: { host: 'smtp.gmail.com', port: 587 }, oauth: 'google' },
       migadu:   { label: 'Migadu',                  emailEx: 'you@yourdomain.com', imap: { host: 'imap.migadu.com',          port: 993, starttls: false }, smtp: { host: 'smtp.migadu.com',    port: 465 } },
       icloud:   { label: 'iCloud',                  emailEx: 'you@icloud.com',    imap: { host: 'imap.mail.me.com',         port: 993, starttls: false }, smtp: { host: 'smtp.mail.me.com',   port: 587 } },
-      outlook:  { label: 'Outlook / Office 365',    emailEx: 'you@outlook.com',   imap: { host: 'outlook.office365.com',    port: 993, starttls: false }, smtp: { host: 'smtp.office365.com', port: 587 } },
+      outlook:  { label: 'Outlook / Office 365',    emailEx: 'you@outlook.com',   imap: { host: 'outlook.office365.com',    port: 993, starttls: false }, smtp: { host: 'smtp.office365.com', port: 587, security: 'starttls' }, oauth: 'microsoft' },
       fastmail: { label: 'Fastmail',                emailEx: 'you@fastmail.com',  imap: { host: 'imap.fastmail.com',        port: 993, starttls: false }, smtp: { host: 'smtp.fastmail.com',  port: 465 } },
       yahoo:    { label: 'Yahoo',                   emailEx: 'you@yahoo.com',     imap: { host: 'imap.mail.yahoo.com',      port: 993, starttls: false }, smtp: { host: 'smtp.mail.yahoo.com', port: 465 } },
       dovecot:  { label: 'Dovecot IMAP (no SMTP)',  emailEx: 'you@example.com',   imap: { host: '',                         port: 31143, starttls: false }, smtp: { host: '',                   port: 465 } },
     };
+    const OAUTH_LABELS = { google: 'Google', microsoft: 'Microsoft' };
     const _providerOptions = Object.entries(PROVIDERS)
       .map(([k, v]) => `<option value="${k}">${esc(v.label)}</option>`).join('');
     // Provider logos — small SVGs the custom dropdown renders next to each
@@ -4297,9 +4533,21 @@ async function initUnifiedIntegrations() {
           <div class="settings-row"><label class="settings-label">Email${_hint('Your email address. Used as the From: header on outgoing mail and as the display label when Name is blank.')}</label><input id="uf-email-from" class="settings-input" placeholder="you@example.com"></div>
           <div class="settings-row"><label class="settings-label">Display Name${_hint('Your name as it appears in the From: field of emails you send, e.g. Jane Smith. Auto-filled from Google during OAuth.')}</label><input id="uf-display-name" class="settings-input" placeholder="Your Name"></div>
           <div id="uf-oauth-section" style="display:none;margin:8px 0;padding:10px;border:1px solid var(--border);border-radius:6px;background:color-mix(in srgb,var(--accent,#50fa7b) 6%,transparent)">
-            <div style="font-size:11px;font-weight:600;margin-bottom:6px">Google OAuth2 — required for Workspace / .edu accounts</div>
-            <div id="uf-oauth-status" style="font-size:11px;opacity:0.7;margin-bottom:6px">${existing && existing.oauth_provider === 'google' ? '✓ Connected via Google OAuth' : 'Not connected — click below to authorize'}</div>
-            <button type="button" id="uf-oauth-btn" class="admin-btn-add" style="font-size:11px">${existing && existing.oauth_provider === 'google' ? 'Reconnect with Google' : 'Connect with Google'}</button>
+            <div id="uf-oauth-title" style="font-size:11px;font-weight:600;margin-bottom:6px">OAuth2 — required for this provider</div>
+            <div id="uf-oauth-status" style="font-size:11px;opacity:0.7;margin-bottom:6px">${existing && existing.oauth_provider ? `✓ Connected via ${esc(OAUTH_LABELS[existing.oauth_provider] || existing.oauth_provider)} OAuth` : 'Not connected — click below to authorize'}</div>
+            <div id="uf-oauth-app-config" style="display:none;margin-bottom:8px;padding-top:8px;border-top:1px dashed var(--border);">
+              <div id="uf-oauth-app-msg" style="font-size:11px;opacity:0.85;margin-bottom:6px"></div>
+              <div id="uf-oauth-app-fields" style="display:none">
+                <div class="settings-row"><label class="settings-label">Client ID</label><input id="uf-oauth-client-id" class="settings-input" placeholder="OAuth app Client ID"></div>
+                <div class="settings-row"><label class="settings-label">Client Secret</label><input id="uf-oauth-client-secret" type="password" class="settings-input" placeholder="OAuth app Client Secret"></div>
+                <div class="settings-row" id="uf-oauth-tenant-row" style="display:none"><label class="settings-label">Tenant</label><input id="uf-oauth-tenant" class="settings-input" placeholder="common"></div>
+                <button type="button" id="uf-oauth-app-save" class="admin-btn-add" style="font-size:11px">Save App Credentials</button>
+              </div>
+            </div>
+            <div id="uf-oauth-app-edit-row" style="display:none;margin-bottom:6px;text-align:right">
+              <a href="#" id="uf-oauth-app-edit-link" class="settings-text-link">Edit OAuth app credentials</a>
+            </div>
+            <button type="button" id="uf-oauth-btn" class="admin-btn-add" style="font-size:11px">${existing && existing.oauth_provider ? `Reconnect with ${esc(OAUTH_LABELS[existing.oauth_provider] || existing.oauth_provider)}` : 'Connect'}</button>
           </div>
           <div style="font-size:11px;font-weight:600;opacity:0.6;margin:4px 0 2px;display:flex;align-items:center;gap:5px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent, var(--red));flex-shrink:0;" aria-hidden="true"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>IMAP (Receiving)</div>
           <div class="settings-row"><label class="settings-label">Host${_hint('Your IMAP server, e.g. imap.gmail.com, imap.migadu.com, a LAN host, or a Tailscale IP for Dovecot.')}</label><input id="uf-imap-host" class="settings-input" placeholder="imap.example.com"></div>
@@ -4360,7 +4608,7 @@ async function initUnifiedIntegrations() {
       },
       outlook: {
         title: 'Outlook / Office 365 needs OAuth',
-        body: 'Microsoft disables normal password login for IMAP/SMTP in most Outlook and Microsoft 365 accounts. Odysseus does not support Microsoft OAuth/Graph mail yet, so this preset is only a placeholder for future support.',
+        body: 'Microsoft disables normal password login for IMAP/SMTP in most Outlook and Microsoft 365 accounts. Use the "Connect with Microsoft" button above to authorize instead.',
         url: 'https://learn.microsoft.com/exchange/clients-and-mobile-in-exchange-online/disable-basic-authentication-in-exchange-online',
         linkLabel: 'Read Microsoft note',
       },
@@ -4431,14 +4679,25 @@ async function initUnifiedIntegrations() {
     };
 
     // Show/hide the OAuth section and password fields based on provider selection.
+    let _ufOauthProvider = (existing && existing.oauth_provider) || '';
     function _syncOauthUI(providerKey) {
       const p = PROVIDERS[providerKey];
       const isOauth = !!(p && p.oauth);
+      _ufOauthProvider = isOauth ? p.oauth : ((existing && existing.oauth_provider) || '');
       el('uf-oauth-section').style.display = isOauth ? '' : 'none';
+      if (isOauth) {
+        const label = OAUTH_LABELS[p.oauth] || p.oauth;
+        el('uf-oauth-title').textContent = `${label} OAuth2 — required for this provider`;
+        el('uf-oauth-status').textContent = _ufOauthProvider === p.oauth ? `✓ Connected via ${label} OAuth` : 'Not connected — click below to authorize';
+        el('uf-oauth-btn').textContent = _ufOauthProvider === p.oauth ? `Reconnect with ${label}` : `Connect with ${label}`;
+        _renderEmailOauthAppConfig('uf', p.oauth, el('uf-oauth-btn'));
+      }
       formEl.querySelectorAll('.uf-password-section').forEach(r => {
         r.style.display = isOauth ? 'none' : '';
       });
     }
+    _wireEmailOauthAppSave('uf', () => _ufOauthProvider, el('uf-oauth-btn'));
+    _wireEmailOauthAppEditLink('uf', () => _ufOauthProvider);
 
     // Custom dropdown wire-up — the native <select> stays in the DOM as the
     // data source and accessibility target, but the visible UI is a button +
@@ -4515,20 +4774,35 @@ async function initUnifiedIntegrations() {
     });
 
     // Init OAuth UI for accounts already connected via OAuth.
-    if (existing && existing.oauth_provider === 'google') _syncOauthUI('google_workspace');
+    if (existing && existing.oauth_provider) _syncOauthUI(existing.oauth_provider === 'microsoft' ? 'outlook' : 'google_workspace');
 
-    // "Connect with Google" — save the account first, then redirect to OAuth.
+    // "Connect with <Provider>" — save the account first, then redirect to OAuth.
     el('uf-oauth-btn').addEventListener('click', async () => {
+      // Open the popup synchronously (before any await) so browsers still
+      // treat it as a direct result of this user gesture.
+      const popup = _openEmailOauthPopupWindow();
       const body = _collectBody();
       if (!body.name) body.name = body.from_address;
-      if (!body.name) { el('uf-email-msg').textContent = 'Enter a Name or Email first'; el('uf-email-msg').style.color = 'var(--red)'; return; }
+      if (!body.name) { el('uf-email-msg').textContent = 'Enter a Name or Email first'; el('uf-email-msg').style.color = 'var(--red)'; try { popup && popup.close(); } catch (e) {} return; }
       const url = isEdit ? `/api/email/accounts/${editId}` : '/api/email/accounts';
       const method = isEdit ? 'PUT' : 'POST';
       const r = await fetch(url, { method, credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const d = await r.json();
-      if (!(d.ok || d.id)) { el('uf-email-msg').textContent = d.error || 'Save failed'; el('uf-email-msg').style.color = 'var(--red)'; return; }
+      if (!(d.ok || d.id)) { el('uf-email-msg').textContent = d.error || 'Save failed'; el('uf-email-msg').style.color = 'var(--red)'; try { popup && popup.close(); } catch (e) {} return; }
       const accId = isEdit ? editId : d.id;
-      window.location.href = `/api/email/oauth/google/authorize?account_id=${encodeURIComponent(accId)}`;
+      const provider = _ufOauthProvider || 'google';
+      const authUrl = `/api/email/oauth/${encodeURIComponent(provider)}/authorize?account_id=${encodeURIComponent(accId)}`;
+      const result = await _waitForEmailOauthPopupResult(popup, authUrl);
+      if (result.success) {
+        if (existing) existing.oauth_provider = provider;
+        _ufOauthProvider = provider;
+        el('uf-oauth-status').textContent = `✓ Connected via ${esc(OAUTH_LABELS[provider] || provider)} OAuth`;
+        el('uf-oauth-btn').textContent = `Reconnect with ${OAUTH_LABELS[provider] || provider}`;
+        el('uf-email-msg').textContent = 'Connected'; el('uf-email-msg').style.color = '';
+      } else if (result.error) {
+        el('uf-email-msg').textContent = `OAuth failed: ${String(result.error).replace(/_/g, ' ')}`;
+        el('uf-email-msg').style.color = 'var(--red)';
+      }
     });
 
     // "Same as IMAP" toggle — hide the SMTP creds rows when on.
@@ -5618,11 +5892,28 @@ export function close() {
 (function _handleOauthRedirect() {
   const sp = new URLSearchParams(window.location.search);
   if (!sp.has('email_oauth_success') && !sp.has('email_oauth_error')) return;
+  const success = sp.has('email_oauth_success');
+  const errMsg = sp.get('email_oauth_error') || '';
+
+  // Opened as a popup from the account form's "Connect"/"Reconnect" button
+  // (see `_openEmailOauthPopup` above) — notify the opener via postMessage
+  // and close immediately instead of loading the full Settings UI in the
+  // popup. Falls through to the normal same-tab handling below if this
+  // window has no opener (e.g. popups were blocked and the flow fell back
+  // to a same-tab redirect).
+  if (window.opener && window.opener !== window) {
+    try {
+      window.opener.postMessage({ type: 'odysseus-email-oauth-result', success, error: errMsg }, window.location.origin);
+    } catch (e) { /* opener closed or cross-origin — nothing more to do */ }
+    document.title = success ? 'Connected' : 'Connection failed';
+    document.body.innerHTML = `<div style="font:14px system-ui, sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#111;color:#eee;text-align:center;padding:0 24px;">${success ? '✓ Account connected — this window will close automatically.' : 'Connection failed: ' + (errMsg ? esc(errMsg.replace(/_/g, ' ')) : 'unknown error')}</div>`;
+    setTimeout(() => { try { window.close(); } catch (e) {} }, success ? 700 : 3000);
+    return;
+  }
+
   // Strip params from URL without a page reload.
   const clean = window.location.pathname + window.location.hash;
   window.history.replaceState(null, '', clean);
-  const success = sp.has('email_oauth_success');
-  const errMsg = sp.get('email_oauth_error') || '';
   // Open settings → integrations once the document is ready. This module owns
   // the open() API, so it does not need to wait for a window-level alias.
   function _showResult() {
@@ -5630,8 +5921,8 @@ export function close() {
     // Brief toast-style banner.
     const banner = document.createElement('div');
     banner.textContent = success
-      ? 'Google account connected — email is ready'
-      : `Google OAuth failed: ${errMsg || 'unknown error'}`;
+      ? 'Email account connected — email is ready'
+      : `Email OAuth failed: ${errMsg || 'unknown error'}`;
     Object.assign(banner.style, {
       position: 'fixed', bottom: '24px', left: '50%', transform: 'translateX(-50%)',
       background: success ? 'var(--accent, #50fa7b)' : 'var(--red, #ff5555)',

@@ -15159,6 +15159,22 @@ body:has(.doc-version-panel:not(.hidden)) .hamburger-btn {
 .mcp-tools-panel .mcp-tools-header a:hover {
   opacity: 1;
 }
+/* Small inline text link used within settings panels/forms (e.g. "Edit
+   OAuth app credentials") — same treatment as .mcp-tools-header a above,
+   just not scoped to that one panel. */
+.settings-text-link {
+  font-size: 11px;
+  opacity: 0.6;
+  color: var(--fg);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--fg) 35%, transparent);
+  text-underline-offset: 2px;
+  cursor: pointer;
+  transition: opacity 0.1s;
+}
+.settings-text-link:hover {
+  opacity: 1;
+}
 .mcp-tools-list {
   max-height: 200px;
   overflow-y: auto;

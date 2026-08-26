@@ -96,6 +96,21 @@ DEFAULT_SETTINGS = {
     "research_endpoint_id": "",
     "research_model": "",
     "research_search_provider": "",
+    # Optional UI-configured OAuth app credentials for email OAuth (Google /
+    # Microsoft "Connect with ..." flows in Settings > Integrations). These
+    # are instance-wide (one app registration serves every user of this
+    # Odysseus install), so — like the other provider keys above — they live
+    # here rather than per-user. When unset, routes/email_helpers.py and
+    # routes/email_routes.py fall back to the GOOGLE_OAUTH_*/MICROSOFT_OAUTH_*
+    # env vars, so existing .env-only setups keep working unchanged. The
+    # *_client_secret values are encrypted at rest (see
+    # _ENCRYPTED_SETTING_KEYS below) since, unlike a search API key, an OAuth
+    # client secret can be used to impersonate the app in a consent flow.
+    "google_oauth_client_id": "",
+    "google_oauth_client_secret": "",
+    "microsoft_oauth_client_id": "",
+    "microsoft_oauth_client_secret": "",
+    "microsoft_oauth_tenant": "",
     "research_max_tokens": 16384,
     "research_extraction_timeout_seconds": 90,
     # Lightweight planning/query LLM calls happen before any search starts.
@@ -226,6 +241,37 @@ DEFAULT_FEATURES = {
     "gallery": True,
 }
 
+# Settings keys that must be encrypted at rest via src.secret_storage. Unlike
+# the other provider keys in DEFAULT_SETTINGS (plaintext in data/settings.json
+# by long-standing convention), an OAuth *client secret* can be replayed by
+# anyone with read access to the settings file to impersonate the app in a
+# consent flow, not just call an API on the operator's behalf — so it gets
+# the same at-rest protection as EmailAccount.oauth_access_token/imap_password.
+_ENCRYPTED_SETTING_KEYS = frozenset({
+    "google_oauth_client_secret",
+    "microsoft_oauth_client_secret",
+})
+
+
+def _decrypt_settings_for_read(settings: dict) -> dict:
+    from src.secret_storage import decrypt as _dec
+    out = dict(settings)
+    for key in _ENCRYPTED_SETTING_KEYS:
+        value = out.get(key)
+        if value:
+            out[key] = _dec(str(value))
+    return out
+
+
+def _encrypt_settings_for_write(settings: dict) -> dict:
+    from src.secret_storage import encrypt as _enc
+    out = dict(settings)
+    for key in _ENCRYPTED_SETTING_KEYS:
+        value = out.get(key)
+        if value:
+            out[key] = _enc(str(value))
+    return out
+
 
 # ── Settings (data/settings.json) ──
 
@@ -243,6 +289,7 @@ def load_settings() -> dict:
         merged = {**DEFAULT_SETTINGS, **saved}
     except (FileNotFoundError, PermissionError, json.JSONDecodeError, ValueError):
         merged = dict(DEFAULT_SETTINGS)
+    merged = _decrypt_settings_for_read(merged)
     _settings_cache = (now, merged)
     return merged
 
@@ -250,7 +297,7 @@ def load_settings() -> dict:
 def save_settings(settings: dict):
     """Persist settings to disk (atomic; see core.atomic_io)."""
     from core.atomic_io import atomic_write_json
-    atomic_write_json(SETTINGS_FILE, settings, indent=2)
+    atomic_write_json(SETTINGS_FILE, _encrypt_settings_for_write(settings), indent=2)
     _invalidate_caches()
 
 

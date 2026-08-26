@@ -99,13 +99,86 @@ def verify_oauth_state(state: str) -> dict | None:
         return None
 
 
+def _oauth_setting_or_env(setting_key: str, env_key: str, default: str = "") -> str:
+    """Resolve an OAuth app credential: UI-configured setting first (set from
+    the email account form when connecting a Google/Outlook account, or via
+    the /oauth/{provider}/app-config route), falling back to the .env /
+    docker-compose value of the same name for existing headless/env-only
+    setups. Returns ``default`` if neither is set."""
+    from src.settings import get_setting
+    value = str(get_setting(setting_key, "") or "").strip()
+    if value:
+        return value
+    return os.environ.get(env_key, default)
+
+
+def _google_oauth_client_id() -> str:
+    return _oauth_setting_or_env("google_oauth_client_id", "GOOGLE_OAUTH_CLIENT_ID")
+
+
+def _google_oauth_client_secret() -> str:
+    return _oauth_setting_or_env("google_oauth_client_secret", "GOOGLE_OAUTH_CLIENT_SECRET")
+
+
+def _microsoft_oauth_client_id() -> str:
+    return _oauth_setting_or_env("microsoft_oauth_client_id", "MICROSOFT_OAUTH_CLIENT_ID")
+
+
+def _microsoft_oauth_client_secret() -> str:
+    return _oauth_setting_or_env("microsoft_oauth_client_secret", "MICROSOFT_OAUTH_CLIENT_SECRET")
+
+
+def _oauth_redirect_uri(request: Request, provider: str, env_key: str) -> str:
+    """Build the OAuth callback redirect URI for `provider` ("google" or
+    "microsoft"), honoring an explicit env-var override first (`env_key`,
+    e.g. GOOGLE_OAUTH_REDIRECT_URI), then falling back to a value derived
+    from the incoming request.
+
+    Odysseus is commonly run behind a reverse proxy or tunnel (e.g.
+    Cloudflare Tunnel) that terminates TLS and forwards plain HTTP to the
+    app — `request.url.scheme` alone would then report "http" even though
+    the public-facing URL (and the redirect URI registered with
+    Google/Microsoft) is "https". We honor the standard `X-Forwarded-Proto`
+    / `X-Forwarded-Host` headers set by such proxies so the generated
+    redirect URI matches what's actually reachable and registered, without
+    requiring every proxied deployment to set the env var override."""
+    forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+    scheme = forwarded_proto or request.url.scheme
+    host = (
+        (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+        or request.headers.get("host", "localhost:7000")
+    )
+    return (
+        os.environ.get(env_key)
+        or f"{scheme}://{host}/api/email/oauth/{provider}/callback"
+    )
+
+
+def _email_oauth_app_config_allowed(request: Request, owner: str) -> bool:
+    """Whether `owner` may configure the instance-wide Google/Microsoft OAuth
+    app Client ID/Secret. This is app-wide config (one Google/Entra app
+    registration shared by every account on this instance), not a per-account
+    secret, so it's gated like other admin-only settings — mirroring
+    `_require_auth`'s three-way branch: auth disabled or no AuthManager
+    attached -> trust; first-run/no-users-yet -> trust (there's no admin to
+    delegate to yet); otherwise -> require `is_admin`."""
+    if _auth_disabled():
+        return True
+    auth_mgr = getattr(request.app.state, "auth_manager", None)
+    if auth_mgr is None:
+        return True
+    if not getattr(auth_mgr, "is_configured", False):
+        return True
+    return bool(auth_mgr.is_admin(owner))
+
+
 def _refresh_google_token(account_id: str) -> str | None:
     """Exchange the stored refresh token for a new access token and persist it."""
     import httpx
     from core.database import SessionLocal as _SL, EmailAccount as _EA
     from src.secret_storage import encrypt as _enc, decrypt as _dec
-    client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "")
-    client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET", "")
+    client_id = _google_oauth_client_id()
+    client_secret = _google_oauth_client_secret()
     if not client_id or not client_secret:
         return None
     db = _SL()
@@ -150,6 +223,85 @@ def _get_valid_google_token(account_id: str, cfg: dict) -> str | None:
     return _refresh_google_token(account_id)
 
 
+def _microsoft_oauth_tenant() -> str:
+    """The Entra ID (Azure AD) tenant to authenticate against.
+
+    Defaults to "common" (any work/school/personal Microsoft account) since
+    Odysseus doesn't know a user's tenant ahead of time. Self-hosters that
+    only ever connect a single-tenant org account can set this in Settings >
+    Integrations > Email OAuth Apps, or pin it via MICROSOFT_OAUTH_TENANT
+    in .env.
+    """
+    return _oauth_setting_or_env("microsoft_oauth_tenant", "MICROSOFT_OAUTH_TENANT", "common").strip() or "common"
+
+
+def _refresh_microsoft_token(account_id: str) -> str | None:
+    """Exchange the stored refresh token for a new Microsoft access token.
+
+    Uses the Microsoft identity platform v2.0 token endpoint. Odysseus talks
+    to Exchange Online IMAP/SMTP directly (XOAUTH2) rather than the Graph
+    mail REST API — Microsoft still fully supports OAuth2 on IMAP/SMTP (only
+    *basic* auth is being retired), so this keeps the existing IMAP/SMTP
+    pipeline instead of a parallel Graph client.
+    """
+    import httpx
+    from core.database import SessionLocal as _SL, EmailAccount as _EA
+    from src.secret_storage import encrypt as _enc, decrypt as _dec
+    client_id = _microsoft_oauth_client_id()
+    client_secret = _microsoft_oauth_client_secret()
+    if not client_id or not client_secret:
+        return None
+    db = _SL()
+    try:
+        row = db.get(_EA, account_id)
+        if not row or not row.oauth_refresh_token:
+            return None
+        refresh_token = _dec(row.oauth_refresh_token or "")
+        if not refresh_token:
+            return None
+        tenant = _microsoft_oauth_tenant()
+        resp = httpx.post(f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token", data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+            "scope": (
+                "https://outlook.office.com/IMAP.AccessAsUser.All "
+                "https://outlook.office.com/SMTP.Send offline_access"
+            ),
+        }, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        access_token = data["access_token"]
+        row.oauth_access_token = _enc(access_token)
+        row.oauth_token_expiry = str(int(time.time()) + data.get("expires_in", 3600))
+        # Microsoft may rotate the refresh token on each exchange.
+        new_refresh = data.get("refresh_token")
+        if new_refresh:
+            row.oauth_refresh_token = _enc(new_refresh)
+        db.commit()
+        return access_token
+    except Exception:
+        logger.warning(f"Microsoft token refresh failed for account {account_id}")
+        return None
+    finally:
+        db.close()
+
+
+def _get_valid_microsoft_token(account_id: str, cfg: dict) -> str | None:
+    """Return a valid Microsoft access token, refreshing if expired or missing."""
+    from src.secret_storage import decrypt as _dec
+    access_token = _dec(cfg.get("oauth_access_token") or "")
+    expiry_str = cfg.get("oauth_token_expiry") or ""
+    if access_token and expiry_str:
+        try:
+            if int(expiry_str) - 60 > time.time():
+                return access_token
+        except (ValueError, TypeError):
+            pass
+    return _refresh_microsoft_token(account_id)
+
+
 def _smtp_security_mode(cfg: dict) -> str:
     raw = str(cfg.get("smtp_security") or "").strip().lower()
     if raw in {"ssl", "starttls", "none"}:
@@ -168,10 +320,17 @@ def _send_smtp_message(cfg: dict, from_addr: str, recipients: list[str], message
     password = cfg.get("smtp_password") or ""
 
     def _auth_smtp(smtp):
-        if cfg.get("oauth_provider") == "google":
+        provider = cfg.get("oauth_provider")
+        if provider == "google":
             token = _get_valid_google_token(cfg.get("account_id"), cfg)
             if not token:
                 raise RuntimeError("Google OAuth token unavailable — reconnect the account")
+            smtp.ehlo()
+            smtp.auth("XOAUTH2", lambda challenge=None: _xoauth2_raw(user, token), initial_response_ok=True)
+        elif provider == "microsoft":
+            token = _get_valid_microsoft_token(cfg.get("account_id"), cfg)
+            if not token:
+                raise RuntimeError("Microsoft OAuth token unavailable — reconnect the account")
             smtp.ehlo()
             smtp.auth("XOAUTH2", lambda challenge=None: _xoauth2_raw(user, token), initial_response_ok=True)
         elif user and password:
@@ -217,9 +376,9 @@ def _friendly_email_auth_error(protocol: str, host: str, error: object) -> str:
     if microsoft_basic_auth_failure:
         return (
             "Microsoft no longer accepts normal mailbox passwords for "
-            "Outlook/Office 365 IMAP/SMTP in most accounts. Odysseus "
-            "does not support Microsoft OAuth/Graph mail yet, so Outlook "
-            "accounts cannot be added with this password form."
+            "Outlook/Office 365 IMAP/SMTP in most accounts. Use "
+            "\"Connect with Microsoft\" (OAuth) instead of a password for "
+            "this account."
         )
     return raw[:200]
 
@@ -1228,10 +1387,16 @@ def _imap_connect(account_id: str | None = None, owner: str = "",
         timeout=timeout,
     )
     try:
-        if cfg.get("oauth_provider") == "google":
+        oauth_provider = cfg.get("oauth_provider")
+        if oauth_provider == "google":
             token = _get_valid_google_token(cfg.get("account_id"), cfg)
             if not token:
                 raise RuntimeError("Google OAuth token unavailable — reconnect the account in Settings → Integrations")
+            conn.authenticate("XOAUTH2", lambda x: _xoauth2_bytes(cfg["imap_user"], token))
+        elif oauth_provider == "microsoft":
+            token = _get_valid_microsoft_token(cfg.get("account_id"), cfg)
+            if not token:
+                raise RuntimeError("Microsoft OAuth token unavailable — reconnect the account in Settings → Integrations")
             conn.authenticate("XOAUTH2", lambda x: _xoauth2_bytes(cfg["imap_user"], token))
         else:
             conn.login(cfg["imap_user"], cfg["imap_password"])
