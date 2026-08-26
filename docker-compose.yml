@@ -85,6 +85,9 @@ services:
         condition: service_healthy
       chromadb:
         condition: service_started
+    networks:
+      - odysseus-net
+      - cf-net
     restart: unless-stopped
 
   chromadb:
@@ -95,6 +98,8 @@ services:
       - chromadb-data:/chroma/chroma
     environment:
       - ANONYMIZED_TELEMETRY=FALSE
+    networks:
+      - odysseus-net
     restart: unless-stopped
 
   searxng:
@@ -122,7 +127,7 @@ services:
         /usr/local/searxng/.venv/bin/python /tmp/migrate-searxng-settings.py /etc/searxng/settings.yml || true
         exec /usr/local/searxng/entrypoint.sh
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8088:8080"
     volumes:
       - searxng-data:/etc/searxng
       - ./config/searxng/settings.yml:/tmp/searxng-settings.yml.template:ro,z
@@ -150,6 +155,8 @@ services:
       timeout: 6s
       retries: 20
       start_period: 10s
+    networks:
+      - odysseus-net
     restart: unless-stopped
 
   ntfy:
@@ -161,9 +168,32 @@ services:
       - ntfy-cache:/var/cache/ntfy
     environment:
       - NTFY_BASE_URL=${NTFY_BASE_URL:-http://localhost:8091}
+    networks:
+      - odysseus-net
     restart: unless-stopped
+
+  cloudflare-tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
+    restart: unless-stopped
+    networks:
+      - cf-net
+    depends_on:
+      - odysseus
+    healthcheck:
+      test: ["CMD", "cloudflared", "version"]
+      interval: 1m
+      timeout: 10s
 
 volumes:
   searxng-data:
   chromadb-data:
   ntfy-cache:
+
+networks:
+  odysseus-net:
+    driver: bridge
+  cf-net:
+    driver: bridge
